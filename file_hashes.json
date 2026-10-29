@@ -1,16 +1,20 @@
 {
     "/home/ubuntu/sec-monitor/fim_monitor.py": "dd4d1abf34982094c5ba3b033883c25e57dcb30569554e29fdedf654f6712713",
-    "/home/ubuntu/sec-monitor/app.py": "ca8e67885962918b224c41d075b529038de1e27066dcbdb4d2989350108b2569",
+    "/home/ubuntu/sec-monitor/update_fix.py": "40eba79b11c9461d2bd8f9f6833f23ef4b74e088af243706c1da565ab9ed2a95",
+    "/home/ubuntu/sec-monitor/app.py": "ff85c873a54b8279afe322b1131641302575e9d3950eccb6d15c6c1d04bcc94e",
     "/home/ubuntu/sec-monitor/code_auditor.py": "35c1d1b8805ad5db77ae38c45ebea0be13d57784247b4ffb97f5fec76bba0de1",
     "/home/ubuntu/sec-monitor/endpoint_inspector.py": "cc92febd26cffc3ba688bbc180604c9fbd56b04169c4c7036793e2e0b33aa81e",
+    "/home/ubuntu/sec-monitor/update_security.py": "b375adad2cc0fd829a1e9775dbc6657b581f83341acc14242a8636e2fb1a7fb1",
     "/home/ubuntu/sec-monitor/.env": "0f82ed7d7d7c8b07842469e5ce522bda9d2bbcfd47e33010cc63f9685bc9de44",
+    "/home/ubuntu/sec-monitor/fix_full_bot.py": "bbdc8f8e2440dd8ab819e7770ad7d814755eb436072fb63666afeedb09d94ffb",
     "/home/ubuntu/sec-monitor/auth_audit.py": "ace2c256cdcc1466756ce81403413613b4ead61e18e130c53f9e71f08647738d",
     "/home/ubuntu/sec-monitor/api_extractor.py": "ed97fd762de98e699ee6a3ed4b5bbbf6113e4cf53fd4216883d60c856b46b488",
     "/home/ubuntu/sec-monitor/content_scraper.py": "10d54c05121e3fe491ee8d1f3e490fc49bbab0d52ba3990c185b46f607d76da8",
     "/home/ubuntu/sec-monitor/payload_injector.py": "51266eca2621ca3ddb1fa17756e9227ebf7cc8d6d37cf0c8d26e7392c48f6058",
     "/home/ubuntu/sec-monitor/log_analyzer.py": "32db88c572eb31261c6c4221c3481371df70cf6fdd069878f729aa302ace9fc5",
-    "/home/ubuntu/sec-monitor/file_hashes.json": "1d182edaaa46701bce66a2105eddc4ea8a165deb56054d311793658b060f255d",
+    "/home/ubuntu/sec-monitor/file_hashes.json": "fa8e22c15258315a430cb9d42c5614e263ea6e2f0142974d15d55f0f99b21c24",
     "/home/ubuntu/sec-monitor/auto_reporter.py": "d61531ef52adac0f027e96972e9465384a95112a1aaa121875cb1d4cea9f0707",
     "/home/ubuntu/sec-monitor/fuzzer.py": "637c39268bd28e942849f6215dfd264a2343c6eefd3dea2ae08bed31d7c4743d",
-    "/home/ubuntu/sec-monitor/file_downloader.py": "227f020b24320454814ba45ac8b80fc8c6a0643982853f7e5e02032dbc5d642d"
+    "/home/ubuntu/sec-monitor/file_downloader.py": "227f020b24320454814ba45ac8b80fc8c6a0643982853f7e5e02032dbc5d642d",
+    "/home/ubuntu/sec-monitor/telegram_bot/bot_handler.py": "0717987f9c962c680f8003e1fecc6c7812193fbf354324bf30860ecded08c693"
 }

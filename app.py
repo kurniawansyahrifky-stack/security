@@ -1,31 +1,20 @@
+from telegram_bot.bot_handler import start_telegram_listener
 
 import socket
 import time
-
-def measure_target_latency(host, port=443, timeout=2):
-    try:
-        start_t = time.time()
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((host, port))
-        s.close()
-        latency = round((time.time() - start_t) * 1000, 1)
-        return int(latency)
-    except Exception:
-        return 0
-
 import os
 import re
-import time
 import html
+import shutil
 import sqlite3
 import threading
 import zipfile
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, Response
+from collections import defaultdict
+from urllib.parse import unquote
 import requests
 import psutil
-from urllib.parse import unquote
+from flask import Flask, request, jsonify, render_template_string, Response
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,12 +22,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("OWNER_ID")
 PORT = int(os.getenv("PORT", 8080))
 DB_PATH = "security_logs.db"
+BACKUP_DIR = "backups"
 
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 CF_ZONE_ID = os.getenv("CF_ZONE_ID", "")
 CF_RECORD_ID = os.getenv("CF_RECORD_ID", "")
 BACKUP_TARGET_CNAME = os.getenv("BACKUP_CNAME", "38.253.224.31:31151")
-
 
 app = Flask(__name__)
 db_lock = threading.Lock()
@@ -58,6 +47,18 @@ HONEYPOT_TRAPS = [
     "/.env", "/config.json", "/backup.sql", "/xmlrpc.php", "/admin.php"
 ]
 
+def measure_target_latency(host, port=443, timeout=2):
+    try:
+        start_t = time.time()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        latency = round((time.time() - start_t) * 1000, 1)
+        return int(latency)
+    except Exception:
+        return 0
+
 def get_real_ip():
     if request.headers.get("CF-Connecting-IP"):
         return request.headers.get("CF-Connecting-IP")
@@ -69,8 +70,24 @@ def init_db():
     with db_lock:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, ip TEXT, country TEXT, target_domain TEXT, method TEXT, path TEXT, is_threat INTEGER, threats TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS client_targets (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT UNIQUE, backend_url TEXT, client_name TEXT, status TEXT DEFAULT 'ACTIVE', added_at TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            timestamp TEXT, ip TEXT, country TEXT, 
+            target_domain TEXT, method TEXT, path TEXT, 
+            is_threat INTEGER, threats TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS client_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            domain TEXT UNIQUE, backend_url TEXT, 
+            client_name TEXT, db_source_path TEXT DEFAULT '', 
+            status TEXT DEFAULT 'ACTIVE', added_at TEXT
+        )""")
+        # Cek kolom db_source_path agar kompatibel dengan data lama
+        c.execute("PRAGMA table_info(client_targets)")
+        cols = [row[1] for row in c.fetchall()]
+        if "db_source_path" not in cols:
+            c.execute("ALTER TABLE client_targets ADD COLUMN db_source_path TEXT DEFAULT ''")
+
         c.execute("""CREATE TABLE IF NOT EXISTS admin_whitelist (ip TEXT PRIMARY KEY, device_name TEXT, added_at TEXT)""")
         conn.commit()
         conn.close()
@@ -90,8 +107,12 @@ def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
-    except:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", 
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, 
+            timeout=10
+        )
+    except Exception:
         pass
 
 def send_telegram_document(file_path, caption=""):
@@ -99,44 +120,148 @@ def send_telegram_document(file_path, caption=""):
         return False
     try:
         with open(file_path, 'rb') as f:
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument", data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, files={'document': f}, timeout=30)
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument", 
+                data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, 
+                files={'document': f}, 
+                timeout=45
+            )
             return resp.status_code == 200
-    except:
+    except Exception:
         return False
 
 def trigger_cloudflare_failover():
-    if not CF_API_TOKEN or not CF_ZONE_ID or not CF_RECORD_ID:
+    token = os.getenv("CF_API_TOKEN")
+    zone = os.getenv("CF_ZONE_ID")
+    record = os.getenv("CF_RECORD_ID")
+    cname = "backup.devgarf.my.id"
+    if not token or not zone or not record:
         return False
-    url = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE_ID}/dns_records/{CF_RECORD_ID}"
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}", "Content-Type": "application/json"}
+    url = f"https://api.cloudflare.com/client/v4/zones/{zone}/dns_records/{record}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"content": cname, "type": "CNAME", "name": "monitor"}
     try:
-        resp = requests.patch(url, json={"content": BACKUP_TARGET_CNAME, "type": "CNAME"}, headers=headers, timeout=10)
-        return resp.status_code == 200 and resp.json().get("success")
-    except:
+        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
+        is_success = resp.status_code == 200 and resp.json().get("success", False)
+        if is_success:
+            msg = chr(10).join(["🚨 <b>FAILOVER CLOUDFLARE BERHASIL!</b> 🚨", "━━━━━━━━━━━━━━━━━━━━━", f"DNS diarahkan ke: <code>{cname}</code>"])
+            send_telegram(msg)
+        return is_success
+    except Exception:
         return False
 
-def perform_system_backup(manual=False):
+def perform_system_backup(target_domain=None):
+    """
+    Jika target_domain=None: Backup Full Gateway SOC
+    Jika target_domain diberikan: Backup file / DB spesifik domain tersebut
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    zip_filename = f"garf_backup_{timestamp}.zip"
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    
     try:
-        with db_lock:
-            if not os.path.exists(DB_PATH): return False
-            with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(DB_PATH, arcname=os.path.basename(DB_PATH))
-        success = send_telegram_document(zip_filename, f"🛡️ <b>GARF BACKUP</b>\n📅 {timestamp}")
-        if os.path.exists(zip_filename): os.remove(zip_filename)
+        if not target_domain:
+            zip_filename = f"garf_backup_{timestamp}.zip"
+            local_zip_path = os.path.join(BACKUP_DIR, zip_filename)
+            
+            with db_lock:
+                if not os.path.exists(DB_PATH): return False
+                with zipfile.ZipFile(local_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    zipf.write(DB_PATH, arcname=os.path.basename(DB_PATH))
+                    if os.path.exists(".env"):
+                        zipf.write(".env", arcname=".env")
+                    if os.path.exists("file_hashes.json"):
+                        zipf.write("file_hashes.json", arcname="file_hashes.json")
+
+            success = send_telegram_document(local_zip_path, f"🛡️ <b>GARF SOC GATEWAY BACKUP</b>\n📅 {timestamp}")
+        else:
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("SELECT client_name, db_source_path FROM client_targets WHERE domain = ?", (target_domain,))
+                row = c.fetchone()
+                conn.close()
+
+            if not row:
+                send_telegram(f"⚠️ Domain <code>{target_domain}</code> tidak ditemukan.")
+                return False
+
+            c_name, db_source = row
+            clean_dom = re.sub(r'[^a-zA-Z0-9]', '_', target_domain)
+            zip_filename = f"backup_{clean_dom}_{timestamp}.zip"
+            local_zip_path = os.path.join(BACKUP_DIR, zip_filename)
+
+            with zipfile.ZipFile(local_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                if db_source and os.path.exists(db_source):
+                    if os.path.isdir(db_source):
+                        for root, _, files in os.walk(db_source):
+                            for f in files:
+                                fp = os.path.join(root, f)
+                                zipf.write(fp, arcname=os.path.relpath(fp, db_source))
+                    else:
+                        zipf.write(db_source, arcname=os.path.basename(db_source))
+                else:
+                    zipf.writestr("info.txt", f"Backup Domain: {target_domain}\nNama: {c_name}\nWaktu: {timestamp}\nCatatan: Path DB spesifik belum diset.")
+
+            success = send_telegram_document(local_zip_path, f"🌐 <b>BACKUP KLIEN: {c_name}</b>\n• Domain: <code>{target_domain}</code>\n• File: <code>{db_source or 'Metadata SOC'}</code>\n📅 {timestamp}")
+
+        # Rotasi: pertahankan hanya 10 file backup terakhir
+        existing_backups = sorted([os.path.join(BACKUP_DIR, f) for f in os.listdir(BACKUP_DIR) if f.endswith(".zip")])
+        if len(existing_backups) > 10:
+            for old_file in existing_backups[:-10]:
+                try: os.remove(old_file)
+                except: pass
+                    
         return success
-    except:
-        if os.path.exists(zip_filename): os.remove(zip_filename)
+    except Exception as e:
+        print(f"[X] Backup Error: {e}")
         return False
+
+def restore_backup_file(zip_filename):
+    file_path = os.path.join(BACKUP_DIR, zip_filename)
+    if not os.path.exists(file_path):
+        return False, "File backup tidak ditemukan!"
+
+    try:
+        with zipfile.ZipFile(file_path, 'r') as zipf:
+            file_names = zipf.namelist()
+            if "security_logs.db" in file_names:
+                with db_lock:
+                    if os.path.exists(DB_PATH):
+                        shutil.copyfile(DB_PATH, f"{DB_PATH}.prev")
+                    zipf.extract("security_logs.db", ".")
+                    if ".env" in file_names:
+                        zipf.extract(".env", ".")
+                return True, "Database SOC Gateway & .env berhasil dipulihkan."
+            else:
+                extract_target = os.path.join(BACKUP_DIR, "restored_" + zip_filename.replace(".zip", ""))
+                os.makedirs(extract_target, exist_ok=True)
+                zipf.extractall(extract_target)
+                return True, f"File berhasil diekstrak ke: <code>{extract_target}</code>"
+    except Exception as e:
+        return False, str(e)
 
 def background_backup_scheduler():
     while True:
         time.sleep(21600)
-        try: perform_system_backup(manual=False)
+        try: perform_system_backup()
         except: pass
 
 threading.Thread(target=background_backup_scheduler, daemon=True).start()
+
+def background_log_cleaner():
+    while True:
+        time.sleep(86400)
+        try:
+            with db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 10000)")
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
+
+threading.Thread(target=background_log_cleaner, daemon=True).start()
 
 def target_health_prober():
     global server_failover_status
@@ -164,25 +289,6 @@ def target_health_prober():
 
 threading.Thread(target=target_health_prober, daemon=True).start()
 
-def telegram_command_listener():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
-    offset = 0
-    while True:
-        try:
-            resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={offset}&timeout=10", timeout=15).json()
-            for item in resp.get("result", []):
-                offset = item["update_id"] + 1
-                msg = item.get("message", {})
-                if str(msg.get("chat", {}).get("id")) == str(TELEGRAM_CHAT_ID):
-                    text = msg.get("text", "").strip()
-                    if text == "/backup": perform_system_backup(manual=True)
-                    elif text == "/failover": trigger_cloudflare_failover()
-        except:
-            pass
-        time.sleep(1)
-
-threading.Thread(target=telegram_command_listener, daemon=True).start()
-
 def recursive_unquote(data: str) -> str:
     for _ in range(3):
         decoded = unquote(data)
@@ -190,11 +296,27 @@ def recursive_unquote(data: str) -> str:
         data = decoded
     return data
 
+request_trackers = defaultdict(list)
+RATE_LIMIT_MAX = 90
+RATE_LIMIT_PERIOD = 60
+
+def check_rate_limit(ip):
+    now = time.time()
+    request_trackers[ip] = [t for t in request_trackers[ip] if now - t < RATE_LIMIT_PERIOD]
+    if len(request_trackers[ip]) >= RATE_LIMIT_MAX:
+        return True
+    request_trackers[ip].append(now)
+    return False
+
+@app.before_request
 def global_waf_interceptor():
+    client_ip = get_real_ip()
+    if check_rate_limit(client_ip):
+        return jsonify({"error": "Too Many Requests (Rate Limit Exceeded)"}), 429
+
     if request.path in ['/api/stats', '/api/store', '/api/trigger-backup', '/api/trigger-failover', '/api/add-client', '/api/delete-client']:
         return
     host = request.host.lower().split(':')[0]
-    client_ip = get_real_ip()
     path = request.path
     if host in ["monitor.devgarf.my.id", "monitor.defgarf.my.id", "127.0.0.1", "localhost"]:
         return
@@ -281,7 +403,7 @@ HTML_DASHBOARD = """
         <div class="recovery-card card-online" id="backupCard">
             <div class="card-title">Server Cadangan (Backup VPS)</div>
             <div class="card-status" id="backupStatusText" style="color: #22c55e;"><span style="font-size:14px;">🟢</span> SIAGA (READY)</div>
-                        <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Target: <span style="font-family:monospace; color:#38bdf8;" id="backupTargetLbl">agent-backup.devgarf.my.id</span><br>Ping: <span id="bPing" style="color:#38bdf8;">0ms</span></div>
+            <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Target: <span style="font-family:monospace; color:#38bdf8;" id="backupTargetLbl">agent-backup.devgarf.my.id</span><br>Ping: <span id="bPing" style="color:#38bdf8;">0ms</span></div>
         </div>
         <div class="recovery-card card-online">
             <div class="card-title">Status Disaster Recovery</div>
@@ -301,6 +423,7 @@ HTML_DASHBOARD = """
         <input type="text" id="clientName" class="form-input" placeholder="Nama Klien">
         <input type="text" id="clientDomain" class="form-input" placeholder="Domain (Cth: store.devgarf.my.id)">
         <input type="text" id="clientBackend" class="form-input" placeholder="URL Backend (Cth: http://127.0.0.1:5020)">
+        <input type="text" id="clientDbPath" class="form-input" placeholder="Path DB Lokal (Opsional, Cth: /var/www/store/db.sqlite)">
         <button class="form-btn" onclick="addNewClient()">Daftarkan Klien</button>
     </div>
 
@@ -337,8 +460,9 @@ HTML_DASHBOARD = """
             let name = document.getElementById('clientName').value.trim();
             let domain = document.getElementById('clientDomain').value.trim().toLowerCase();
             let backend = document.getElementById('clientBackend').value.trim();
-            if(!name || !domain || !backend) return alert("Isi semua kolom!");
-            let res = await fetch('/api/add-client', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_name: name, domain: domain, backend_url: backend }) });
+            let dbPath = document.getElementById('clientDbPath').value.trim();
+            if(!name || !domain || !backend) return alert("Isi nama, domain, dan backend!");
+            let res = await fetch('/api/add-client', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_name: name, domain: domain, backend_url: backend, db_source_path: dbPath }) });
             let data = await res.json();
             if(data.success) { alert("Sukses!"); location.reload(); } else { alert("Gagal: " + data.error); }
         }
@@ -425,7 +549,6 @@ HTML_DASHBOARD = """
     </script>
 
 <script>
-// Auto update Backup Server status & latency
 setInterval(async () => {
     try {
         let res = await fetch('/api/stats');
@@ -456,7 +579,6 @@ PAGE_404 = """<!doctype html><html lang=en><title>404 Not Found</title><h1>Not F
 @app.route('/dashboard', methods=['GET'])
 def render_dashboard():
     host = request.host.lower().split(':')[0]
-    client_ip = get_real_ip()
     if host not in ["monitor.devgarf.my.id", "monitor.defgarf.my.id", "127.0.0.1", "localhost"]:
         return proxy_handler('')
     return render_template_string(HTML_DASHBOARD)
@@ -468,8 +590,11 @@ def api_add_client():
         with db_lock:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
-            c.execute("INSERT OR REPLACE INTO client_targets (domain, backend_url, client_name, status, added_at) VALUES (?, ?, ?, 'ACTIVE', ?)",
-                      (data.get('domain'), data.get('backend_url'), data.get('client_name'), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            c.execute("""INSERT OR REPLACE INTO client_targets 
+                         (domain, backend_url, client_name, db_source_path, status, added_at) 
+                         VALUES (?, ?, ?, ?, 'ACTIVE', ?)""",
+                      (data.get('domain'), data.get('backend_url'), data.get('client_name'), 
+                       data.get('db_source_path', ''), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             conn.commit()
             conn.close()
         return jsonify({"success": True})
@@ -492,7 +617,7 @@ def api_delete_client():
 
 @app.route('/api/trigger-backup', methods=['POST'])
 def api_trigger_backup():
-    return jsonify({"success": perform_system_backup(manual=True)})
+    return jsonify({"success": perform_system_backup()})
 
 @app.route('/api/trigger-failover', methods=['POST'])
 def api_trigger_failover():
@@ -530,7 +655,16 @@ def proxy_handler(subpath):
         conn.close()
 
     try:
-        resp = requests.request(method=request.method, url=f"{backend_url.rstrip('/')}/{subpath}", headers={k: v for k, v in request.headers if k != 'Host'}, params=request.args, data=request.get_data(), cookies=request.cookies, allow_redirects=False, timeout=10)
+        resp = requests.request(
+            method=request.method, 
+            url=f"{backend_url.rstrip('/')}/{subpath}", 
+            headers={k: v for k, v in request.headers if k != 'Host'}, 
+            params=request.args, 
+            data=request.get_data(), 
+            cookies=request.cookies, 
+            allow_redirects=False, 
+            timeout=10
+        )
         return Response(resp.content, resp.status_code)
     except Exception as e:
         return f"Proxy Error: {e}", 502
@@ -545,7 +679,7 @@ def get_stats():
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT domain, backend_url, client_name, status FROM client_targets")
+        c.execute("SELECT domain, backend_url, client_name, db_source_path, status FROM client_targets")
         clients_raw = [dict(row) for row in c.fetchall()]
         clients_data = []
         for cl in clients_raw:
@@ -572,5 +706,22 @@ def get_stats():
         "backup_server": {"alive": True, "target": "agent-backup.devgarf.my.id", "latency": measure_target_latency("agent-backup.devgarf.my.id")}
     })
 
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers.pop("Server", None)
+    response.headers.pop("X-Powered-By", None)
+    return response
+
 if __name__ == '__main__':
+    # Background Telegram Listener dengan fungsi Full Backup, Failover, dan Restore
+    threading.Thread(
+        target=start_telegram_listener, 
+        args=(perform_system_backup, trigger_cloudflare_failover, restore_backup_file), 
+        daemon=True
+    ).start()
+    
     app.run(host='0.0.0.0', port=PORT, threaded=True)
